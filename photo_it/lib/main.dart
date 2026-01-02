@@ -10,114 +10,9 @@ import 'gallery_saver.dart' if (dart.library.html) 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'dart:typed_data';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 
 final deviceInfoPlugin = DeviceInfoPlugin();
-
-// 백그라운드에서 실행할 이미지 처리 함수 (Top-level)
-Future<Uint8List> _processImageInBackground(Map<String, dynamic> params) async {
-  final Uint8List imageBytes = params['imageBytes'];
-  final List<Map<String, dynamic>> blurPointsData = List<Map<String, dynamic>>.from(params['blurPoints']);
-  final double scaleFactor = params['scaleFactor'];
-  final int jpegQuality = params['jpegQuality'];
-  final int blurRadius = params['blurRadius'];
-
-  // 이미지 디코딩
-  img.Image? originalImage = img.decodeImage(imageBytes);
-
-  if (originalImage == null) {
-    throw Exception('이미지를 읽을 수 없습니다');
-  }
-
-  // RGB 포맷으로 변환
-  if (originalImage.numChannels == 4) {
-    final srcImage = originalImage;
-    originalImage = img.Image(
-      width: srcImage.width,
-      height: srcImage.height,
-      numChannels: 3,
-    );
-
-    for (int y = 0; y < originalImage.height; y++) {
-      for (int x = 0; x < originalImage.width; x++) {
-        final srcPixel = srcImage.getPixel(x, y);
-        originalImage.setPixelRgb(x, y, srcPixel.r.toInt(), srcPixel.g.toInt(), srcPixel.b.toInt());
-      }
-    }
-  }
-
-  img.Image resultImage = originalImage;
-
-  if (blurPointsData.isNotEmpty) {
-    // 원본 이미지 복사
-    final originalCopy = originalImage.clone();
-
-    // 전체 이미지에 블러 적용
-    final blurredFull = img.gaussianBlur(originalCopy, radius: blurRadius);
-
-    // 블러 마스크 생성
-    final mask = img.Image(
-      width: originalImage.width,
-      height: originalImage.height,
-      numChannels: 1,
-    );
-
-    for (int y = 0; y < mask.height; y++) {
-      for (int x = 0; x < mask.width; x++) {
-        mask.setPixelRgb(x, y, 0, 0, 0);
-      }
-    }
-
-    // 블러 포인트를 마스크에 표시
-    for (var pointData in blurPointsData) {
-      final x = (pointData['offsetX'] * originalImage.width).toInt();
-      final y = (pointData['offsetY'] * originalImage.height).toInt();
-      final radius = (pointData['size'] * originalImage.width / 2).toInt();
-
-      for (int dy = -radius; dy <= radius; dy++) {
-        for (int dx = -radius; dx <= radius; dx++) {
-          final px = x + dx;
-          final py = y + dy;
-
-          if (px >= 0 && px < mask.width && py >= 0 && py < mask.height) {
-            final distance = (dx * dx + dy * dy).toDouble();
-            if (distance <= radius * radius) {
-              mask.setPixelRgb(px, py, 255, 255, 255);
-            }
-          }
-        }
-      }
-    }
-
-    // 마스크를 사용하여 원본과 블러 이미지 합성
-    resultImage = originalImage.clone();
-
-    for (int y = 0; y < resultImage.height; y++) {
-      for (int x = 0; x < resultImage.width; x++) {
-        final maskValue = mask.getPixel(x, y).r.toInt();
-
-        if (maskValue > 0) {
-          final blurPixel = blurredFull.getPixel(x, y);
-          resultImage.setPixelRgb(x, y, blurPixel.r.toInt(), blurPixel.g.toInt(), blurPixel.b.toInt());
-        }
-      }
-    }
-  }
-
-  // 이미지 크기 조정
-  if (scaleFactor < 1.0) {
-    resultImage = img.copyResize(
-      resultImage,
-      width: (resultImage.width * scaleFactor).toInt(),
-      height: (resultImage.height * scaleFactor).toInt(),
-      interpolation: img.Interpolation.average,
-    );
-  }
-
-  // JPEG 인코딩
-  final jpegBytes = img.encodeJpg(resultImage, quality: jpegQuality);
-
-  return Uint8List.fromList(jpegBytes);
-}
 
 void main() {
   runApp(const MyApp());
@@ -312,6 +207,7 @@ class BlurEditWidget extends StatefulWidget {
 class _BlurEditWidgetState extends State<BlurEditWidget> {
   final List<BlurPoint> _blurPoints = [];
   final GlobalKey _imageKey = GlobalKey();
+  final GlobalKey _repaintBoundaryKey = GlobalKey(); // 위젯 캡처용 키
   bool _isSaving = false;
   double _blurIntensity = 15.0;
   double _blurSize = 30.0;
@@ -573,7 +469,7 @@ class _BlurEditWidgetState extends State<BlurEditWidget> {
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  '이미지 처리 중...',
+                  '이미지 저장 중...',
                   style: TextStyle(
                     color: Colors.white.withOpacity(0.9),
                     fontSize: 16,
@@ -592,24 +488,20 @@ class _BlurEditWidgetState extends State<BlurEditWidget> {
       final timestamp = DateTime.now().millisecondsSinceEpoch;
 
       // 품질 설정
-      double scaleFactor;
       int jpegQuality;
       String qualityName;
 
       switch (quality) {
         case 'low':
-          scaleFactor = 0.5;
           jpegQuality = 70;
           qualityName = '저화질';
           break;
         case 'medium':
-          scaleFactor = 0.75;
           jpegQuality = 85;
           qualityName = '중간';
           break;
         case 'high':
         default:
-          scaleFactor = 1.0;
           jpegQuality = 95;
           qualityName = '원본';
           break;
@@ -617,42 +509,34 @@ class _BlurEditWidgetState extends State<BlurEditWidget> {
 
       if (kDebugMode) {
         print('저장 시작: $timestamp ($qualityName 품질)');
-        print('설정: 크기 ${(scaleFactor * 100).toInt()}%, JPEG 품질 $jpegQuality%');
+        print('설정: JPEG 품질 $jpegQuality%');
       }
 
-      // 이미지 읽기
-      final bytes = await widget.imageFile.readAsBytes();
-
-      // 블러 강도 계산
-      final maxIntensity = _blurPoints.isNotEmpty
-          ? _blurPoints.map((p) => p.intensity).reduce((a, b) => a > b ? a : b)
-          : 15.0;
-      final blurRadius = (maxIntensity * 11).toInt();
-
-      if (kDebugMode) {
-        print('블러 포인트 개수: ${_blurPoints.length}');
-        print('블러 강도: UI sigma=$maxIntensity, 저장 radius=$blurRadius');
+      // 🚀 핵심 최적화: UI에서 렌더링된 결과를 그대로 캡처!
+      final boundary = _repaintBoundaryKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) {
+        throw Exception('이미지 렌더링 오류');
       }
 
-      // 백그라운드에서 이미지 처리 (UI 멈춤 없음!)
-      final jpegBytes = await compute<Map<String, dynamic>, Uint8List>(
-        _processImageInBackground,
-        {
-          'imageBytes': bytes,
-          'blurPoints': _blurPoints.map((p) => {
-            'offsetX': p.offset.dx,
-            'offsetY': p.offset.dy,
-            'intensity': p.intensity,
-            'size': p.size,
-          }).toList(),
-          'scaleFactor': scaleFactor,
-          'jpegQuality': jpegQuality,
-          'blurRadius': blurRadius,
-        },
+      // 위젯을 이미지로 변환 (1초 이내!)
+      final image = await boundary.toImage(pixelRatio: quality == 'low' ? 1.0 : (quality == 'medium' ? 1.5 : 2.0));
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+
+      if (byteData == null) {
+        throw Exception('이미지 변환 실패');
+      }
+
+      final pngBytes = byteData.buffer.asUint8List();
+
+      // PNG를 JPEG로 변환 (압축)
+      final jpegBytes = await FlutterImageCompress.compressWithList(
+        pngBytes,
+        quality: jpegQuality,
+        format: CompressFormat.jpeg,
       );
 
       if (kDebugMode) {
-        print('백그라운드 처리 완료: ${jpegBytes.length} bytes (${(jpegBytes.length / 1024 / 1024).toStringAsFixed(2)} MB)');
+        print('캡처 완료: ${jpegBytes.length} bytes (${(jpegBytes.length / 1024 / 1024).toStringAsFixed(2)} MB)');
       }
 
       // 플랫폼별 저장
@@ -908,53 +792,56 @@ class _BlurEditWidgetState extends State<BlurEditWidget> {
               ),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(20),
-                child: Stack(
-                  children: [
-                    // 원본 이미지
-                    SizedBox(
-                      key: _imageKey,
-                      width: double.infinity,
-                      height: double.infinity,
-                      child: Image.file(
-                        widget.imageFile,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                    // 블러된 이미지 레이어
-                    Positioned.fill(
-                      child: ClipPath(
-                        clipper: BlurClipper(_blurPoints, _imageSize),
-                        child: BackdropFilter(
-                          filter: ui.ImageFilter.blur(
-                            sigmaX: _blurIntensity,
-                            sigmaY: _blurIntensity,
-                          ),
-                          child: Container(
-                            color: Colors.transparent,
-                          ),
+                child: RepaintBoundary(
+                  key: _repaintBoundaryKey,
+                  child: Stack(
+                    children: [
+                      // 원본 이미지
+                      SizedBox(
+                        key: _imageKey,
+                        width: double.infinity,
+                        height: double.infinity,
+                        child: Image.file(
+                          widget.imageFile,
+                          fit: BoxFit.contain,
                         ),
                       ),
-                    ),
-                    // 브러쉬 크기 미리보기
-                    if (_currentTouchPosition != null)
-                      Positioned(
-                        left: _currentTouchPosition!.dx - _blurSize / 2,
-                        top: _currentTouchPosition!.dy - _blurSize / 2,
-                        child: IgnorePointer(
-                          child: Container(
-                            width: _blurSize,
-                            height: _blurSize,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: Colors.white.withOpacity(0.5),
-                                width: 2,
-                              ),
+                      // 블러된 이미지 레이어
+                      Positioned.fill(
+                        child: ClipPath(
+                          clipper: BlurClipper(_blurPoints, _imageSize),
+                          child: BackdropFilter(
+                            filter: ui.ImageFilter.blur(
+                              sigmaX: _blurIntensity,
+                              sigmaY: _blurIntensity,
+                            ),
+                            child: Container(
+                              color: Colors.transparent,
                             ),
                           ),
                         ),
                       ),
-                  ],
+                      // 브러쉬 크기 미리보기 (캡처 시 제외)
+                      if (_currentTouchPosition != null && !_isSaving)
+                        Positioned(
+                          left: _currentTouchPosition!.dx - _blurSize / 2,
+                          top: _currentTouchPosition!.dy - _blurSize / 2,
+                          child: IgnorePointer(
+                            child: Container(
+                              width: _blurSize,
+                              height: _blurSize,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: Colors.white.withOpacity(0.5),
+                                  width: 2,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ),
